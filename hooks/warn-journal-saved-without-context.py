@@ -72,20 +72,56 @@ def _norm(text):
     return text.replace("\\", "/")
 
 
+# One label token (e.g. an emoji folder prefix) may sit between the vault root and
+# `Journals/`, as in `<vault>/📓 Journals/Agosto 2026/`. It must be a SINGLE token:
+# no slashes, no whitespace, and no quotes. Excluding quotes is what stops a shell
+# prefix from being swallowed here — see _vault_root.
+_LABEL = r"(?:[^/\n\"'\s]+\s)?"
+_MONTH = r"Journals/[A-Z][a-zA-Z]+\s+\d{4}/"
+
+# `cd "<abs>" && ... Journals/<Month YYYY>/...` — the idiom the skill's own Bash
+# examples produce when the journal path is written relative to the vault.
+_CD_RE = re.compile(r"(?:^|[;&|]\s*)cd\s+[\"']?((?:(?<![A-Za-z])[A-Za-z]:)?/[^\n\"']+)[\"']?")
+
+
 def _vault_root(text):
-    """Absolute dir before the '<optional emoji >Journals/<Month YYYY>/' segment.
+    r"""Absolute dir before the '<optional label >Journals/<Month YYYY>/' segment.
     Anchored on the absolute path (starts at a real '/', or a `C:/` drive root),
     so a leading shell prefix like `cat > '/vault/.../x.md'` is NOT captured into
-    the root (that was the 2026-07-07 Bash-path fail-open bug). Quotes bound the
-    segment on the Bash path.
+    the root (that was the 2026-07-07 Bash-path fail-open bug).
 
     The drive-letter alternative is guarded by `(?<![A-Za-z])` so a URL like
-    `http://host/Journals/May 2026/` cannot have its `p:` read as a drive."""
+    `http://host/Journals/May 2026/` cannot have its `p:` read as a drive.
+
+    2026-08-24 fix: the label group used to be `[^/\n]*\s`, which allows quotes.
+    On `cd "/Users/mac/Brain" && cat > "📓 Journals/Agosto 2026/x.md"` it happily
+    matched `Brain" && cat > "📓 ` as the label, leaving the root truncated to
+    `/Users/mac` — so the marker lookup pointed outside the vault and every save
+    was DENIED with a correct-looking path. A false block, not a fail-open: worse
+    than the bug it replaced, because the guard looked like it was working.
+    The label is now a single quote-free, space-free token.
+
+    Second half of the fix: when the journal path is RELATIVE (the common form,
+    since a `cd` into the vault comes first), there is no absolute path to anchor
+    on and this used to fail open — the guard silently did nothing. Fall back to
+    the `cd` target, but only if that directory actually contains the Journals
+    path from the command."""
     m = re.search(
-        r"((?:(?<![A-Za-z])[A-Za-z]:)?/[^\n\"']*?)/(?:[^/\n]*\s)?"
-        r"Journals/[A-Z][a-zA-Z]+\s+\d{4}/",
+        r"((?:(?<![A-Za-z])[A-Za-z]:)?/[^\n\"']*?)/" + _LABEL + _MONTH,
         text)
-    return m.group(1) if m else None
+    if m:
+        return m.group(1)
+
+    # Relative journal path: anchor on `cd <abs>` when it really is the vault.
+    rel = re.search(_LABEL + _MONTH, text)
+    if not rel:
+        return None
+    cds = _CD_RE.findall(text)
+    for cand in reversed(cds):          # last cd wins
+        cand = cand.rstrip("/") or "/"
+        if os.path.isdir(os.path.join(cand, rel.group(0).rstrip("/"))):
+            return cand
+    return None
 
 
 def _marker_exists(vault, date_iso):
@@ -93,6 +129,28 @@ def _marker_exists(vault, date_iso):
         if os.path.exists(os.path.join(vault, meta, ".journal-context", f"{date_iso}.json")):
             return True
     return False
+
+
+_SHELL_WRITE = ("cat >", "cat >>", "tee ", "tee -", " > ", " >> ", "mv ", "cp ", "rsync ")
+
+# A journal written from an inline interpreter script (`python3 - <<EOF ... EOF`)
+# used to sail straight past this guard: none of the shell redirect markers above
+# appear in such a command, so `blob` stayed empty and the hook no-opped. Found
+# 2026-08-24, when an entire /journal session's edits were made that way and the
+# guard never fired once. Requires BOTH an interpreter and a write-shaped call, so
+# a read-only script that merely names a journal path still fails open.
+_INTERP_RE = re.compile(r"\b(?:python3?|node|ruby|perl|deno|bun)\b")
+_INTERP_WRITE_RE = re.compile(
+    r"write_text\(|writelines\(|\.write\(|writeFileSync|appendFileSync|"
+    r"File\.write|open\([^)]*['\"][wax]")
+
+
+def _shell_write(cmd):
+    return any(m in cmd for m in _SHELL_WRITE)
+
+
+def _interpreter_write(cmd):
+    return bool(_INTERP_RE.search(cmd)) and bool(_INTERP_WRITE_RE.search(cmd))
 
 
 try:
@@ -117,9 +175,7 @@ elif tool_name == "Bash":
        re.search(r"(^|\s)JOURNAL_CONTEXT_BYPASS=1(\s|$)", cmd):
         sys.exit(0)
     cmd_norm = _norm(cmd)
-    if JOURNAL_PATH_RE.search(cmd_norm) and any(
-        m in cmd for m in ("cat >", "cat >>", "tee ", "tee -", " > ", " >> ", "mv ", "cp ", "rsync ")
-    ):
+    if JOURNAL_PATH_RE.search(cmd_norm) and (_shell_write(cmd) or _interpreter_write(cmd)):
         # Normalized, because _vault_root() below must see forward slashes too.
         blob = cmd_norm
 
