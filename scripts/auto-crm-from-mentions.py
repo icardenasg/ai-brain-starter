@@ -33,9 +33,10 @@ from _base import VAULT, CRM_ROOT, SKIP_PARTS, WIKILINK_RE, get_crm_names  # noq
 
 def fold_name(name):
     """Accent- and case-insensitive key for matching a candidate to an existing
-    CRM file. Vaults routinely hold 'Eduardo Cardenas.md' while notes write
-    [[Eduardo Cárdenas]] — without folding, every accented mention stubs a
-    duplicate of a contact that already exists."""
+    CRM file. A vault routinely holds 'Ana Ramirez.md' while notes write
+    [[Ana Ramírez]] — without folding, every accented mention stubs a duplicate
+    of a contact that already exists. Bites any vault kept in a language that
+    uses diacritics, which is most of them outside English."""
     decomposed = unicodedata.normalize("NFD", name)
     stripped = "".join(c for c in decomposed if unicodedata.category(c) != "Mn")
     return " ".join(stripped.lower().split())
