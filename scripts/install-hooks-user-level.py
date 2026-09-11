@@ -41,6 +41,10 @@ fires on every session regardless of cwd.
 We ship hooks.json as the canonical source. This script is the install
 mechanism; the source-of-truth content lives in hooks.json.
 """
+# exit-contract: ADVISORY -- the installer path is consumed by bootstrap,
+#   which branches on --fail-on-missing explicitly rather than on the default
+#   exit
+
 
 from __future__ import annotations
 
@@ -117,6 +121,13 @@ WINDOWS_HOOK_TIMEOUT_SECONDS = 60
 # the author registered in both lists below, believed it was active, and said
 # so in the commit message. Tracked as MYC-1031 (structural CI gate).
 ABS_FINGERPRINTS = [
+    "ai-brain-starter/hooks/agent-briefing-check.py",
+    "ai-brain-starter/hooks/validate-calendar-timezone.py",
+    "ai-brain-starter/hooks/nudge-checkpoint-after-pytest-pass.py",
+    "ai-brain-starter/hooks/detect-secrets-in-bash-output.py",
+    "ai-brain-starter/hooks/check-rule-conflicts-on-write.py",
+    "ai-brain-starter/hooks/validate-subagent-return.py",
+    "ai-brain-starter/hooks/scrub-session-jsonl-secrets.py",
     "ai-brain-starter/hooks/detect-closing-signal.py",
     "ai-brain-starter/hooks/verify-session-close-cascade.py",
     "ai-brain-starter/hooks/lint-vault-frontmatter.py",
@@ -164,6 +175,17 @@ ABS_FINGERPRINTS = [
     # commit into a stalled rebase — so it belongs in the substrate and is
     # ACTIVATED here, not left in one machine's ~/.claude (MYC-1017).
     "ai-brain-starter/hooks/block-git-mutation-mid-operation.py",
+    # Its SessionStart counterpart. The gate above BLOCKS mutations while an
+    # operation is paused but never says one exists, so a stalled rebase freezes
+    # every session silently (5 measured: MYC-3777/3451/3982/3781 + 2026-08-24).
+    "ai-brain-starter/hooks/surface-stalled-git-operation.py",
+    # Inline-bypass-REACHABILITY report builder (build_message), called by
+    # surface-deployed-hooks-behind.py's _bypass_unreachable_message() at
+    # its existing SessionStart emission point -- not its own hooks.json
+    # entry (see scripts/check-hook-activation.py TEMPLATE_ONLY). Owned for
+    # the same reason as the "not a hook" builders above: uninstall/retire
+    # tracking, even though it is not independently wired.
+    "ai-brain-starter/hooks/surface-bypass-unreachable.py",
     # MCP secret-leak guards (MYC-3560). Written after three real GitHub PAT
     # leaks, shipped as working files, and never once registered -- the
     # protection everyone believed was in place did not exist. Same
@@ -248,6 +270,13 @@ ABS_FINGERPRINTS = [
 # SCRIPT BASENAME, else a re-run duplicates every hook a hand-maintained config
 # wired at the user-hooks path. Only OUR script basenames are matched this way.
 ABS_OWNED_BASENAMES = {
+    "agent-briefing-check.py",
+    "validate-calendar-timezone.py",
+    "nudge-checkpoint-after-pytest-pass.py",
+    "detect-secrets-in-bash-output.py",
+    "check-rule-conflicts-on-write.py",
+    "validate-subagent-return.py",
+    "scrub-session-jsonl-secrets.py",
     "detect-closing-signal.py", "verify-session-close-cascade.py",
     "lint-vault-frontmatter.py", "log-skill-usage.py",
     "first-week-checkin.py", "migrate-to-user-level.py",
@@ -266,6 +295,9 @@ ABS_OWNED_BASENAMES = {
     # above: a hand-wired ~/.claude/hooks/ copy must dedup against the
     # skill-path copy, or the block fires twice on every git command.
     "block-git-mutation-mid-operation.py",
+    "surface-stalled-git-operation.py",
+    # Inline-bypass-REACHABILITY report builder; see ABS_FINGERPRINTS above.
+    "surface-bypass-unreachable.py",
     # MCP secret-leak guards (MYC-3560): same basename-dedup reasoning as the
     # two gates above.
     "block-claude-mcp-inline-secret.py", "block-mcp-config-inline-secret.py",
@@ -301,6 +333,15 @@ ABS_OWNED_BASENAMES = {
     # committed basenames against owned deployed ones — every Windows user would
     # get a "1 background helper is not active" nag that no action can clear.
     "pre-write-settings-lint.py", "lint-claude-settings.py",
+    # sdd-cache-pre.sh / sdd-cache-post.sh are deliberately NOT owned, for the
+    # same reason as check-claude-code-version.sh above: they are bash-only, so
+    # platformize_template_for_windows skips wiring them on Windows. Owning a
+    # hook that Windows never wires is permanent false drift for
+    # hooks/surface-deployed-hooks-behind.py, which diffs owned committed
+    # basenames against owned deployed ones -- every Windows user would get a
+    # "2 background helpers are not active" nag that no action can clear.
+    # Measured: owning them failed test_windows_platformize T5 (drift surfacer
+    # FIRED on a healthy Windows install); unowning them restored 10/10.
     # Phase-05 hooks, moved to the installer route 2026-08-13 (see
     # HOME_HOOKS_INSTALLER_DEPLOYS). Owned for the same reason as the two
     # above: unowned means verify_paths_on_disk() never looks at them, and a
@@ -366,6 +407,7 @@ HOME_HOOKS_LIB_DEPS = {
     "vault_root.py",   # vault-context.py -> vault_root_for()
     "standing_report.py",  # dev-hub-refresh + orphan-claude-branches -> condense()
     "session_echo.py",     # available to any per-prompt injector -> should_emit()
+    "claude_project_key.py",  # context-budget-measure.py -> claude_project_key()
 }
 
 # Hooks ai-brain-starter USED TO ship and has deliberately RETIRED. The

@@ -21,6 +21,11 @@ irreducibly creative work (conversation scan + verbatim capture).
 Behavior contract:
   - Reads user prompt from stdin (Claude Code hook contract)
   - Detects close signal via language-pack regex + optional Haiku fallback
+  - The shared packs' natural-language tiers only look at SHORT prompts
+    (SHORT_PROMPT_MAX_CHARS) and anchor ^/$ to the whole message or to its
+    last line, so a line ending in "listo" inside a pasted handoff is not a
+    sign-off; the explicit slash-command tier and the user's custom phrases
+    fire at any length
   - Runs FAST prep (timestamp, paths, marker file, decisions-with-empty-outcome
     list, recently-touched-files list, session-file shell pre-build)
   - Returns additionalContext that injects all of the above plus the cascade
@@ -91,19 +96,49 @@ except Exception:  # fail-open: if the lib cannot load, behave as before
         return collapse_worktree(Path(env_vault_root) if env_vault_root else cwd)
 
 
+# Longest prompt the shared language-pack sign-off tiers will look at. A real
+# sign-off is a few words; anything longer is work being pasted in (a brief, a
+# spec, a handoff) even when one of its lines happens to end in "listo" or
+# "thanks". Only the natural-language tiers are gated by this — the `explicit`
+# slash-command tier and the user's own custom phrases fire at any length.
+SHORT_PROMPT_MAX_CHARS = 300
+
+
 def log_debug(msg: str) -> None:
     if os.environ.get("CLOSING_SIGNAL_DEBUG") == "1":
         print(f"[detect-closing-signal] {msg}", file=sys.stderr)
 
 
 def read_hook_input() -> dict:
-    """Read JSON from stdin (Claude Code hook contract)."""
+    """Read JSON from stdin (Claude Code hook contract).
+
+    Reads RAW BYTES and decodes UTF-8 explicitly. Claude Code pipes the payload
+    as UTF-8, but text-mode ``sys.stdin`` decodes with the locale codepage —
+    cp1252 on a default Windows console. Every non-ASCII character in the prompt
+    is mangled before the patterns ever see it, so an accented close phrase
+    silently never matches: "cerrar sesión" arrives as "cerrar sesiÃ³n" and the
+    cascade does not fire. It is a read-side twin of the write-side cp1252 crash
+    guarded at ``__main__`` (#314/#483); the guard there reconfigures stdout and
+    stderr, not stdin, so this path stayed broken.
+
+    Failure mode is silent and total for the affected users: no crash, no log,
+    the hook just returns "no close signal" for every accented phrase. It only
+    looked fine on machines where PYTHONUTF8=1 happened to be set.
+
+    ``sys.stdin.buffer`` bypasses the text decoder, so the result is identical
+    on every OS and locale. ``errors="replace"`` keeps a malformed byte from
+    raising where the old text-mode path would have substituted too.
+    """
     try:
-        raw = sys.stdin.read()
+        buf = getattr(sys.stdin, "buffer", None)
+        if buf is not None:
+            raw = buf.read().decode("utf-8", errors="replace")
+        else:  # no binary buffer (stdin replaced, e.g. by a test harness)
+            raw = sys.stdin.read()
         if not raw.strip():
             return {}
         return json.loads(raw)
-    except (json.JSONDecodeError, OSError) as e:
+    except (json.JSONDecodeError, OSError, UnicodeError) as e:
         log_debug(f"failed to read hook input: {e}")
         return {}
 
@@ -355,11 +390,38 @@ def classify_signal(
         log_debug("customOnly set and no custom match — skipping shared pack tiers")
         return (None, None)
 
+    # A sign-off is short and it ENDS the message; a pasted brief, spec, or
+    # handoff is work, not a wave. Three false positives in nine days on one
+    # Spanish vault ("ya está" and "Borrador listo" as inner lines of multi-line
+    # handoffs, "estoy listo para el día" as a readiness statement) shared two
+    # causes: re.MULTILINE let every $-anchored sign-off pattern match the end
+    # of ANY line, and the length of the message was never considered.
+    #
+    # The shared language-pack tiers are therefore matched against the whole
+    # message WITHOUT MULTILINE (so `$` is the true end of the message) and,
+    # separately, against its last line alone (so a `^bye`-shaped pattern still
+    # recognizes "All good.\nbye" — the goodbye is on the last line, where a
+    # goodbye belongs). An inner line ending in "listo" satisfies neither. The
+    # natural-language tiers additionally only look at short prompts. The
+    # `explicit` tier (slash commands like /close, /cerrar) still fires at any
+    # length — typing a command is deliberate — and the user's own custom
+    # phrases keep their original semantics for the same reason.
+    is_short = len(text) <= SHORT_PROMPT_MAX_CHARS
+    last_line = text.splitlines()[-1].strip() if "\n" in text else text
+
+    def _pack_match(pattern: str) -> bool:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+        return last_line != text and bool(re.search(pattern, last_line, re.IGNORECASE))
+
     # Strong tiers (explicit, high_confidence) override FP guards
     for level in ("explicit", "high_confidence"):
+        if level == "high_confidence" and not is_short:
+            log_debug("prompt too long for high_confidence sign-off detection, skipping tier")
+            continue
         for pattern in packs.get(level, []):
             try:
-                if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+                if _pack_match(pattern):
                     log_debug(f"matched [{level}] (FP guard bypassed): {pattern}")
                     return (level, pattern)
             except re.error as e:
@@ -367,6 +429,9 @@ def classify_signal(
                 continue
 
     # For weaker tiers (emoji_only, ambiguous), apply FP guards
+    if not is_short:
+        log_debug("prompt too long for weak-tier sign-off detection, skipping")
+        return (None, None)
     if is_false_positive(text, packs.get("false_positive_guards", [])):
         log_debug("false-positive guard matched (no strong-tier match), skipping")
         return (None, None)
@@ -374,7 +439,7 @@ def classify_signal(
     for level in ("emoji_only", "ambiguous"):
         for pattern in packs.get(level, []):
             try:
-                if re.search(pattern, text, re.IGNORECASE | re.MULTILINE):
+                if _pack_match(pattern):
                     log_debug(f"matched [{level}]: {pattern}")
                     return (level, pattern)
             except re.error as e:
@@ -1208,6 +1273,13 @@ def main() -> int:
             "verify-session-close-cascade",
             "verify-discoverability-on-close",
             "verify-cascade",
+            # Codified 2026-08-02: automated events are not user speech.
+            # A background-agent task-notification carried result text
+            # containing "ya fue corregido", which matched the es-pack
+            # high_confidence pattern and fired a full cascade mid-session.
+            "[SYSTEM NOTIFICATION",
+            "<task-notification>",
+            "automated background-task event",
         )
         if any(m in prefix for m in feedback_markers):
             log_debug("Stop-hook-feedback prompt, skipping close detection")
@@ -1230,6 +1302,8 @@ def main() -> int:
             if x.strip()
         ]
         packs = load_language_packs(langs)
+
+
         custom = load_user_custom_signals(vault_root)
         suppress = load_user_suppress_signals(vault_root)
         custom_only = load_user_custom_only(vault_root)

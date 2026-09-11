@@ -22,12 +22,27 @@ from pathlib import Path
 
 # Folders that may hold floor notes, relative to the vault root. Every one that
 # exists is read and merged — a vault may carry more than one layout.
+#
+# This list alone was not enough. It carried the emoji + Spanish spelling
+# ("📝 Notas/Floors") but not the emoji + English one — and "📝 Notes/Floors" is
+# exactly what phase-02-03 creates and what phase-10a writes the 34 floor notes
+# into on a default English install. Those vaults read as having no floor
+# vocabulary at all, so build-journal-index.py printed "no floor notes found —
+# frontmatter consistency check skipped" and the check silently never ran.
+#
+# The named layouts stay for clarity; discovery below is what makes the module
+# live up to its own docstring ("Any vault works, in any language").
 FLOOR_NOTE_DIRS = (
     ("floors",),
     ("Notes", "Floors"),
     ("Notas", "Floors"),
     ("📝 Notas", "Floors"),
+    ("📝 Notes", "Floors"),
 )
+
+# Folder names that mean "notes" / "floors", compared without emoji or accents.
+NOTES_FOLDER_NAMES = ("notes", "notas")
+FLOORS_FOLDER_NAMES = ("floors", "pisos")
 
 # Tier vocabulary normalises onto these three. Keys are accent-stripped
 # lowercase. This is not a floor list: it is the three-way tier split, which
@@ -49,11 +64,77 @@ def strip_accents(s):
                    if unicodedata.category(c) != "Mn")
 
 
+_WIKILINK = re.compile(r"^\[\[([^\]|#]+)(?:\|([^\]]+))?\]\]$")
+
+
+def strip_wikilink(s):
+    """`[[Acceptance|Aceptación]]` -> `Aceptación`; `[[Joy]]` -> `Joy`.
+
+    Floor values are wikilinks in frontmatter on purpose: a plain string
+    draws no graph edge, so writing the floor as text silently disconnects
+    the entire floor system from the vault. Every consumer that compares or
+    indexes a floor name has to see through the link syntax first.
+    Non-links pass through unchanged.
+    """
+    if not isinstance(s, str):
+        return s
+    m = _WIKILINK.match(s.strip().strip('"').strip("'"))
+    return (m.group(2) or m.group(1)).strip() if m else s
+
+
 def normalise_name(s):
-    """Floor names compare accent-insensitively and case-insensitively."""
+    """Floor names compare accent-insensitively, case-insensitively, and
+    through wikilink syntax."""
     if s is None:
         return ""
-    return strip_accents(str(s).strip().lower())
+    return strip_accents(strip_wikilink(str(s)).strip().lower())
+
+
+def folder_key(name):
+    """Folder names compare without emoji, punctuation, accents or case.
+
+    '📝 Notes' -> 'notes'. Vault folders are user-facing and routinely carry an
+    emoji prefix, so an exact-string match is the wrong tool for finding them.
+    """
+    # Accents come off FIRST. strip_accents decomposes and drops every
+    # nonspacing mark, which is also where a variation selector (U+FE0F, the
+    # invisible half of "🗂️") lives. Dropping it later leaves the space it was
+    # glued to and the key comes back as " floors" instead of "floors".
+    text = strip_accents(str(name))
+    cleaned = "".join(c for c in text
+                      if not unicodedata.category(c).startswith(("S", "P", "C")))
+    return cleaned.strip().lower()
+
+
+def discover_floor_dirs(root):
+    """Folders under `root` that hold floor notes, whatever they are called.
+
+    Looks one level down only: a root-level floors/pisos folder, or a
+    notes/notas folder containing one. Cheap, and covers the emoji-prefixed
+    spellings in any language without enumerating them.
+    """
+    found = []
+    try:
+        children = sorted(root.iterdir())
+    except OSError:
+        return found
+    for child in children:
+        if not child.is_dir():
+            continue
+        key = folder_key(child.name)
+        if key in FLOORS_FOLDER_NAMES:
+            found.append(child)
+            continue
+        if key not in NOTES_FOLDER_NAMES:
+            continue
+        try:
+            inner = sorted(child.iterdir())
+        except OSError:
+            continue
+        for sub in inner:
+            if sub.is_dir() and folder_key(sub.name) in FLOORS_FOLDER_NAMES:
+                found.append(sub)
+    return found
 
 
 def normalise_tier(value):
@@ -87,6 +168,13 @@ def parse_inline_list(v):
     s = str(v).strip()
     if not s or s.lower() in ("null", "none", '""', "[]"):
         return []
+    # A wikilink opens and closes with a bracket too, and splitting one as a
+    # flow list drops a bracket and hands back a name that matches nothing:
+    # `[[Willingness|Voluntad]]` came back as `[Willingness|Voluntad]` and every
+    # entry was reported as off the floor scale. It is one value, never a list.
+    unquoted = s.strip("'\"").strip()
+    if unquoted.startswith("[[") and unquoted.endswith("]]"):
+        return [unquoted]
     if s.startswith("[") and s.endswith("]"):
         inner = s[1:-1].strip()
         if not inner:
@@ -120,10 +208,21 @@ class Floors:
         self._names = {}   # normalised name -> floor number
         self._tiers = {}   # floor number -> canonical tier
         root = Path(vault_root)
-        for parts in FLOOR_NOTE_DIRS:
-            folder = root.joinpath(*parts)
+        candidates = [root.joinpath(*parts) for parts in FLOOR_NOTE_DIRS]
+        candidates.extend(discover_floor_dirs(root))
+        seen = set()
+        for folder in candidates:
             if not folder.is_dir():
                 continue
+            # The named list and discovery overlap by design; absorb each
+            # folder once so a note is never counted twice.
+            try:
+                key = folder.resolve()
+            except OSError:
+                key = folder
+            if key in seen:
+                continue
+            seen.add(key)
             for path in sorted(folder.glob("*.md")):
                 self._absorb(path)
 

@@ -160,7 +160,11 @@ Then act on it:
 - If `total_files` is 0: stop with "No supported files found in [path]."
 - If `skipped_sensitive` is non-empty: mention file count skipped, not the file names.
 - If `total_words` > 2,000,000 OR `total_files` > 200: show the warning and the top 5 subdirectories by file count, then ask which subfolder to run on. Wait for the user's answer before proceeding.
-- Otherwise: proceed directly to Step 3 - no need to ask anything.
+- Otherwise: proceed directly to Step 2.5 if the corpus has `video` files, else straight to Step 3 - no need to ask anything.
+
+### Step 2.5 - Transcribe video/audio files (only if `detect` reported video files)
+
+Skip this step entirely if `.graphify_detect.json`'s `files.video` list is empty. Video and audio cannot be read directly - transcribe first, then treat the transcripts as doc files in Step 3. See [TRANSCRIBE.md](references/TRANSCRIBE.md) for the full procedure (writing a domain-hint prompt, `--whisper-model` handling, running `graphify.transcribe.transcribe_all`).
 
 ### Step 3 - Extract entities and relationships
 
@@ -229,6 +233,8 @@ fi
 Pattern source: [garrytan/gbrain](https://github.com/garrytan/gbrain) — zero-LLM graph wiring. The script itself ships at `scripts/wire_typed_relationships.py` inside this skill; it's standalone and zero-dep (stdlib only) so it runs in any Python 3.10+ environment.
 
 If `graphify-out/.graphify_typed_edges.jsonl` exists after this step, Part B's dispatch must pass the path to each subagent so they honor the skip list. Cost savings only materialize if the skip list is honored — otherwise this pass just duplicates work.
+
+This JSONL is a skip list for Part B, nothing merges it into the graph automatically. After Step 4 builds `graph.json`, run Step 4b to generate a human-reviewable report of which of these edges can be safely merged.
 
 #### Part B - Semantic extraction (parallel subagents)
 
@@ -481,6 +487,8 @@ print(f'Merged: {total} nodes, {edges} edges ({len(ast[\"nodes\"])} AST + {len(s
 
 ### Step 4 - Build graph, cluster, analyze, generate outputs
 
+**Before starting:** note whether `--directed` was given in the original invocation. Every `build_from_json(...)` call from here through the exports in Step 7 uses `directed=IS_DIRECTED` — replace `IS_DIRECTED` with the literal `True` if `--directed` was given, otherwise `False` (the default, an undirected graph). Do NOT leave the literal placeholder `IS_DIRECTED` in the code. Track this the same way you tracked `DEEP_MODE` in Step 3 - do not lose it. Skipping this silently rebuilds an undirected graph even when the user asked for directed, and on `--update` it silently collapses reciprocal A<->B edges into one.
+
 ```bash
 mkdir -p graphify-out
 $(cat graphify-out/.graphify_python) -c "
@@ -495,7 +503,7 @@ from pathlib import Path
 extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
 detection  = json.loads(Path('graphify-out/.graphify_detect.json').read_text())
 
-G = build_from_json(extraction)
+G = build_from_json(extraction, directed=IS_DIRECTED)
 communities = cluster(G)
 cohesion = score_all(G, communities)
 tokens = {'input': extraction.get('input_tokens', 0), 'output': extraction.get('output_tokens', 0)}
@@ -506,6 +514,7 @@ from graphify_seed_labels import seed_labels
 # Provisional names from each community's highest-degree member ('Money', 'Fear'),
 # never 'Community 412'. Step 5 replaces these with semantic labels.
 labels = seed_labels(G, communities)
+# Placeholder questions - regenerated with real labels in Step 5
 questions = suggest_questions(G, communities, labels)
 
 report = generate(G, communities, cohesion, labels, gods, surprises, detection, tokens, 'INPUT_PATH', suggested_questions=questions)
@@ -557,6 +566,21 @@ If this step prints `ERROR: Graph is empty`, stop and tell the user what happene
 
 Replace INPUT_PATH with the actual path.
 
+#### Step 4b - Review Part A.5's typed edges (if Part A.5 ran)
+
+Part A.5's typed edges are NOT auto-merged into `graph.json` — see the "Part A.5" section above for why: node IDs from Part B are LLM-improvised per entity (not a deterministic function of the source file), so a wikilink target can match zero, one, or several nodes, and the wikilink-derived edge types (`mentions`, `journaled_about`, `attended`, `investor_for`) already appear in `graph.json` via Part B with an entity-points-at-document direction that Part A.5's raw file-points-at-wikilink reading contradicts unless flipped. Blind-merging risks corrupting a graph the user relies on.
+
+If `graphify-out/.graphify_typed_edges.jsonl` exists, run the review script instead:
+
+```bash
+$(cat graphify-out/.graphify_python) "{SKILL_DIR}/scripts/review_typed_edges.py" \
+    --graph graphify-out/graph.json \
+    --edges graphify-out/.graphify_typed_edges.jsonl \
+    --output graphify-out/TYPED_EDGES_REVIEW.md
+```
+
+This resolves what it safely can (unique src/dst match, not already present, direction corrected for the wikilink types) into a "ready to merge" table, and buckets the rest as ambiguous / dst-not-found / src-not-found — mirroring the review-then-apply shape of `WIKILINK_GAPS.md`. Tell the user the report is ready and summarize the bucket counts; do not write anything into `graph.json` without the user reviewing `TYPED_EDGES_REVIEW.md` and saying which rows to apply.
+
 ### Step 5 - Label communities
 
 Read `graphify-out/.graphify_analysis.json`.
@@ -592,7 +616,7 @@ extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
 detection  = json.loads(Path('graphify-out/.graphify_detect.json').read_text())
 analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text())
 
-G = build_from_json(extraction)
+G = build_from_json(extraction, directed=IS_DIRECTED)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 cohesion = {int(k): v for k, v in analysis['cohesion'].items()}
 tokens = {'input': extraction.get('input_tokens', 0), 'output': extraction.get('output_tokens', 0)}
@@ -642,7 +666,7 @@ extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
 analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text())
 labels_raw = json.loads(Path('graphify-out/.graphify_labels.json').read_text()) if Path('graphify-out/.graphify_labels.json').exists() else {}
 
-G = build_from_json(extraction)
+G = build_from_json(extraction, directed=IS_DIRECTED)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 cohesion = {int(k): v for k, v in analysis['cohesion'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
@@ -683,7 +707,7 @@ extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
 analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text())
 labels_raw = json.loads(Path('graphify-out/.graphify_labels.json').read_text()) if Path('graphify-out/.graphify_labels.json').exists() else {}
 
-G = build_from_json(extraction)
+G = build_from_json(extraction, directed=IS_DIRECTED)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
 
@@ -706,7 +730,7 @@ from graphify.build import build_from_json
 from graphify.export import to_cypher
 from pathlib import Path
 
-G = build_from_json(json.loads(Path('graphify-out/.graphify_extract.json').read_text()))
+G = build_from_json(json.loads(Path('graphify-out/.graphify_extract.json').read_text()), directed=IS_DIRECTED)
 to_cypher(G, 'graphify-out/cypher.txt')
 print('cypher.txt written - import with: cypher-shell < graphify-out/cypher.txt')
 "
@@ -724,7 +748,7 @@ from pathlib import Path
 
 extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
 analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text())
-G = build_from_json(extraction)
+G = build_from_json(extraction, directed=IS_DIRECTED)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 
 result = push_to_neo4j(G, uri='NEO4J_URI', user='NEO4J_USER', password='NEO4J_PASSWORD', communities=communities)
@@ -747,7 +771,7 @@ extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
 analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text())
 labels_raw = json.loads(Path('graphify-out/.graphify_labels.json').read_text()) if Path('graphify-out/.graphify_labels.json').exists() else {}
 
-G = build_from_json(extraction)
+G = build_from_json(extraction, directed=IS_DIRECTED)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 labels = {int(k): v for k, v in labels_raw.items()}
 
@@ -768,7 +792,7 @@ from pathlib import Path
 extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
 analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text())
 
-G = build_from_json(extraction)
+G = build_from_json(extraction, directed=IS_DIRECTED)
 communities = {int(k): v for k, v in analysis['communities'].items()}
 
 to_graphml(G, communities, 'graphify-out/graph.graphml')
@@ -795,6 +819,33 @@ To configure in Claude Desktop, add to `claude_desktop_config.json`:
   }
 }
 ```
+
+### Step 7e - Wiki export (only if --wiki flag)
+
+Run this before Step 9 (cleanup) - it reads `.graphify_labels.json`, which Step 5 writes and Step 9 may remove.
+
+```bash
+$(cat graphify-out/.graphify_python) -c "
+import json
+from graphify.build import build_from_json
+from graphify.wiki import to_wiki
+from pathlib import Path
+
+extraction = json.loads(Path('graphify-out/.graphify_extract.json').read_text())
+analysis   = json.loads(Path('graphify-out/.graphify_analysis.json').read_text())
+labels_path = Path('graphify-out/.graphify_labels.json')
+labels = {int(k): v for k, v in json.loads(labels_path.read_text()).items()} if labels_path.exists() else {}
+
+G = build_from_json(extraction, directed=IS_DIRECTED)
+communities = {int(k): v for k, v in analysis['communities'].items()}
+cohesion = {int(k): v for k, v in analysis['cohesion'].items()}
+
+n = to_wiki(G, communities, 'graphify-out/wiki', community_labels=labels, cohesion=cohesion, god_nodes_data=analysis.get('gods'))
+print(f'wiki: {n} article(s) written to graphify-out/wiki/ (plus index.md)')
+"
+```
+
+Writes `graphify-out/wiki/index.md` (agent entry point, catalog of every article) plus one article per community and per god node. Agent-crawlable: point another agent at `index.md` to navigate the graph without loading the whole `GRAPH_REPORT.md`.
 
 ### Step 8 - Token reduction benchmark (only if total_words > 5000)
 
@@ -890,6 +941,10 @@ The graph is the map. Your job after the pipeline is to be the guide.
 
 - **Incremental update** (`--update`): See [UPDATE_MODES.md](references/UPDATE_MODES.md)
 - **Re-cluster only** (`--cluster-only`): See [UPDATE_MODES.md](references/UPDATE_MODES.md)
+
+## Transcription
+
+- **Video/audio transcription** (`--whisper-model`): only relevant when Step 2's `detect` reports one or more `video` files. See [TRANSCRIBE.md](references/TRANSCRIBE.md)
 
 ## Query Commands
 

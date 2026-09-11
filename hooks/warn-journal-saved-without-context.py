@@ -72,20 +72,45 @@ def _norm(text):
     return text.replace("\\", "/")
 
 
-# One label token (e.g. an emoji folder prefix) may sit between the vault root and
-# `Journals/`, as in `<vault>/📓 Journals/Agosto 2026/`. It must be a SINGLE token:
-# no slashes, no whitespace, and no quotes. Excluding quotes is what stops a shell
-# prefix from being swallowed here — see _vault_root.
-_LABEL = r"(?:[^/\n\"'\s]+\s)?"
-_MONTH = r"Journals/[A-Z][a-zA-Z]+\s+\d{4}/"
+# A heredoc opener: `<< EOF`, `<<'EOF'`, `<<"EOF"`, `<<-EOF`. `<<<` herestrings
+# do not match (the third '<' is not a delimiter character).
+_HEREDOC_RE = re.compile(r"""<<-?[ \t]*(["']?)([A-Za-z_][A-Za-z0-9_]*)\1""")
 
-# `cd "<abs>" && ... Journals/<Month YYYY>/...` — the idiom the skill's own Bash
-# examples produce when the journal path is written relative to the vault.
-_CD_RE = re.compile(r"(?:^|[;&|]\s*)cd\s+[\"']?((?:(?<![A-Za-z])[A-Za-z]:)?/[^\n\"']+)[\"']?")
+
+def _strip_heredocs(cmd):
+    """The command LINES, with every heredoc BODY removed.
+
+    The gate must open on what a command WRITES, not on whatever text it happens
+    to carry. A journal entry's body, a test fixture, or a doc that quotes a
+    journal path all travel inside a heredoc, and matching those opened the gate
+    on writes that are not journal saves at all — measured 2026-08-28, when a
+    write to `tests/integration/*.sh` was blocked because the test's own PROSE
+    contained `Journals/August 2026/`. A guard that fires on unrelated writes
+    teaches the operator to reach for the bypass, and a bypass reached for by
+    habit is how the real block gets waved through.
+
+    Only the GATE narrows. `creationDate:` is still read from the full text,
+    because that lives in the body by construction."""
+    if "<<" not in cmd:
+        return cmd
+    lines = cmd.split("\n")
+    kept, i = [], 0
+    while i < len(lines):
+        line = lines[i]
+        kept.append(line)
+        i += 1
+        for m in _HEREDOC_RE.finditer(line):
+            delim = m.group(2)
+            while i < len(lines) and lines[i].strip() != delim:
+                i += 1
+            i += 1  # drop the closing delimiter line too
+    return "\n".join(kept)
 
 
 def _vault_root(text):
-    r"""Absolute dir before the '<optional label >Journals/<Month YYYY>/' segment.
+    r"""Absolute dir before the '<optional emoji >Journals/<Month YYYY>/' segment,
+    or None when the text carries no ABSOLUTE journal path.
+
     Anchored on the absolute path (starts at a real '/', or a `C:/` drive root),
     so a leading shell prefix like `cat > '/vault/.../x.md'` is NOT captured into
     the root (that was the 2026-07-07 Bash-path fail-open bug).
@@ -93,33 +118,86 @@ def _vault_root(text):
     The drive-letter alternative is guarded by `(?<![A-Za-z])` so a URL like
     `http://host/Journals/May 2026/` cannot have its `p:` read as a drive.
 
-    2026-08-24 fix: the label group used to be `[^/\n]*\s`, which allows quotes.
-    On `cd "/Users/mac/Brain" && cat > "📓 Journals/Agosto 2026/x.md"` it happily
-    matched `Brain" && cat > "📓 ` as the label, leaving the root truncated to
-    `/Users/mac` — so the marker lookup pointed outside the vault and every save
-    was DENIED with a correct-looking path. A false block, not a fail-open: worse
-    than the bug it replaced, because the guard looked like it was working.
-    The label is now a single quote-free, space-free token.
+    The optional emoji-prefix segment is bounded on quotes and shell operators,
+    not only on '/' and newline. Journals are written as
 
-    Second half of the fix: when the journal path is RELATIVE (the common form,
-    since a `cd` into the vault comes first), there is no absolute path to anchor
-    on and this used to fail open — the guard silently did nothing. Fall back to
-    the `cd` target, but only if that directory actually contains the Journals
-    path from the command."""
+        cd "<vault>" && cat > "<emoji> Journals/August 2026/e.md" << 'EOF'
+
+    where the journal path is RELATIVE. With the old `(?:[^/\n]*\s)?` the segment
+    swallowed `vault" && cat > "<emoji> ` and matched `Journals/` anyway, so group 1
+    stopped at the vault's PARENT and the marker was looked up one directory too
+    high (measured 2026-08-28 on a real save). Returning None here is the honest
+    answer for a relative path; `_resolve_root` recovers the real root from the
+    `cd` target or the session cwd."""
     m = re.search(
-        r"((?:(?<![A-Za-z])[A-Za-z]:)?/[^\n\"']*?)/" + _LABEL + _MONTH,
+        r"((?:(?<![A-Za-z])[A-Za-z]:)?/[^\n\"']*?)/(?:[^/\n\"'&|;<>]*\s)?"
+        r"Journals/[A-Z][a-zA-Z]+\s+\d{4}/",
         text)
-    if m:
-        return m.group(1)
+    return m.group(1) if m else None
 
-    # Relative journal path: anchor on `cd <abs>` when it really is the vault.
-    rel = re.search(_LABEL + _MONTH, text)
-    if not rel:
-        return None
-    cds = _CD_RE.findall(text)
-    for cand in reversed(cds):          # last cd wins
-        cand = cand.rstrip("/") or "/"
-        if os.path.isdir(os.path.join(cand, rel.group(0).rstrip("/"))):
+
+# `cd <path>`, honouring quotes and skipping option flags (`cd -P /x`). Bounded on
+# shell operators so it cannot run past the end of the cd word.
+_CD_RE = re.compile(
+    r"""(?:^|[;&|]|\s)cd\s+(?:-[A-Za-z]+\s+)*("[^"\n]+"|'[^'\n]+'|[^\s;&|<>]+)""")
+
+# The journal folder as it is spelled in this command -- `Journals` or, in the
+# default vault layout, `<emoji> Journals`. The class cannot cross '/', so an
+# absolute path yields the last segment only.
+_JOURNAL_DIR_RE = re.compile(r"([^/\n\"']*Journals)/[A-Z][a-zA-Z]+\s+\d{4}/")
+
+
+def _is_vault(root, journal_dirname=None):
+    """True only if `root` actually holds a journals folder.
+
+    This is the check that would have caught the 2026-08-28 bug on its own: the
+    stitched root `/Users/me` holds no Journals dir, so it can never be mistaken
+    for a vault no matter what the regex hands over. A candidate that fails here
+    is discarded rather than trusted, so a wrong guess degrades to fail-open
+    instead of to a confident answer about the wrong directory.
+
+    Metadata-only (isdir/listdir), never a file read, so it stays safe on a
+    cloud-mirrored vault per the cloud-safe-filesystem-walk rule."""
+    try:
+        if not os.path.isdir(root):
+            return False
+        if journal_dirname and os.path.isdir(os.path.join(root, journal_dirname)):
+            return True
+        if os.path.isdir(os.path.join(root, "Journals")):
+            return True
+        for entry in os.listdir(root):
+            if entry.endswith(" Journals") and os.path.isdir(os.path.join(root, entry)):
+                return True
+    except OSError:
+        return False
+    return False
+
+
+def _resolve_root(text, cwd):
+    """The vault root for this write, or None when it cannot be determined.
+
+    Ordered by how directly each candidate names the write target:
+      1. an ABSOLUTE journal path in the text  (strongest -- names the vault itself)
+      2. the `cd` target in the same command   (the relative-path write form)
+      3. the session cwd from the hook payload (relative path, no cd)
+
+    Every candidate must pass `_is_vault`, so a wrong one is dropped instead of
+    being used. None means fail-open, which is the correct posture for ambiguity:
+    this guard blocks only on a POSITIVE determination that the marker is absent."""
+    jm = _JOURNAL_DIR_RE.search(text)
+    journal_dirname = jm.group(1) if jm else None
+
+    candidates = []
+    root = _vault_root(text)
+    if root:
+        candidates.append(root)
+    for cm in _CD_RE.finditer(text):
+        candidates.append(cm.group(1).strip("\"'"))
+    if cwd:
+        candidates.append(cwd)
+
+    for cand in candidates:
+        if cand and _is_vault(cand, journal_dirname):
             return cand
     return None
 
@@ -133,24 +211,39 @@ def _marker_exists(vault, date_iso):
 
 _SHELL_WRITE = ("cat >", "cat >>", "tee ", "tee -", " > ", " >> ", "mv ", "cp ", "rsync ")
 
-# A journal written from an inline interpreter script (`python3 - <<EOF ... EOF`)
+# A journal written from an inline interpreter script (`python3 - <<'EOF' ... EOF`)
 # used to sail straight past this guard: none of the shell redirect markers above
 # appear in such a command, so `blob` stayed empty and the hook no-opped. Found
 # 2026-08-24, when an entire /journal session's edits were made that way and the
-# guard never fired once. Requires BOTH an interpreter and a write-shaped call, so
-# a read-only script that merely names a journal path still fails open.
-_INTERP_RE = re.compile(r"\b(?:python3?|node|ruby|perl|deno|bun)\b")
+# guard never fired once.
+#
+# The interpreter token is looked for in the command LINES, the write call in the
+# FULL text. That split is the whole point: a `python3` on the command line makes
+# the heredoc body a PROGRAM, whose journal path is a real write target, while a
+# `python3` appearing only INSIDE a body is inert data — a test fixture or a doc —
+# and must not open the gate. That is the 2026-08-28 false-positive class
+# `_strip_heredocs` exists to stop, and this branch must not reopen it.
+# Requires BOTH, so a read-only script that merely names a journal path still
+# fails open.
+# The interpreter must sit in COMMAND position and be followed by a flag or a
+# heredoc (`python3 - <<PY`, `python3 <<PY`, `node -e`), never merely appear as
+# a substring. Without that, writing a FILE whose name contains "python3" and
+# whose body holds a journal path would open the gate — the same false-positive
+# class `_strip_heredocs` was written to close.
+_INTERP_RE = re.compile(
+    r"(?:^|[;&|]|\s)(?:python3?|node|ruby|perl|deno|bun)\s+(?:-|<<)")
 _INTERP_WRITE_RE = re.compile(
     r"write_text\(|writelines\(|\.write\(|writeFileSync|appendFileSync|"
     r"File\.write|open\([^)]*['\"][wax]")
 
 
-def _shell_write(cmd):
-    return any(m in cmd for m in _SHELL_WRITE)
+def _shell_write(text):
+    return any(m in text for m in _SHELL_WRITE)
 
 
-def _interpreter_write(cmd):
-    return bool(_INTERP_RE.search(cmd)) and bool(_INTERP_WRITE_RE.search(cmd))
+def _interpreter_write(gate_text, full_text):
+    """True when the COMMAND runs an interpreter and its SCRIPT writes a file."""
+    return bool(_INTERP_RE.search(gate_text)) and bool(_INTERP_WRITE_RE.search(full_text))
 
 
 try:
@@ -162,6 +255,7 @@ tool_name = payload.get("tool_name", "")
 tool_input = payload.get("tool_input", {}) or {}
 
 blob = ""          # text to scan for path + date + vault root
+interp_write = False   # gate opened via the inline-interpreter form
 if tool_name == "Write":
     fp = _norm(tool_input.get("file_path", "") or "")
     if JOURNAL_PATH_RE.search(fp):
@@ -175,15 +269,32 @@ elif tool_name == "Bash":
        re.search(r"(^|\s)JOURNAL_CONTEXT_BYPASS=1(\s|$)", cmd):
         sys.exit(0)
     cmd_norm = _norm(cmd)
-    if JOURNAL_PATH_RE.search(cmd_norm) and (_shell_write(cmd) or _interpreter_write(cmd)):
+    # Gate on the command LINES only (heredoc bodies stripped), so a write whose
+    # PAYLOAD merely mentions a journal path is not mistaken for a journal save.
+    gate_text = _strip_heredocs(cmd_norm)
+    if JOURNAL_PATH_RE.search(gate_text) and _shell_write(gate_text):
         # Normalized, because _vault_root() below must see forward slashes too.
+        # The FULL text (body included) is the blob: the gate narrows, the
+        # creationDate scan must not.
         blob = cmd_norm
+    elif JOURNAL_PATH_RE.search(cmd_norm) and _interpreter_write(gate_text, cmd_norm):
+        # Inline-interpreter form: the heredoc body IS the program, so both the
+        # journal path and the write call legitimately live inside it. Scanned on
+        # the full text for that reason, and only after the interpreter token has
+        # been found on the command lines.
+        blob = cmd_norm
+        interp_write = True
 
 if not blob:
     sys.exit(0)  # not a journal save
 
-vault = _vault_root(blob)
-if not vault or not os.path.isdir(vault):
+# Stripped for the shell form, where a heredoc body is payload that must not be
+# read as a path. NOT stripped for the interpreter form, where the body is the
+# program and its absolute journal path names the real vault.
+vault = _resolve_root(
+    _strip_heredocs(blob) if (tool_name == "Bash" and not interp_write) else blob,
+    payload.get("cwd") or None)
+if not vault:
     sys.exit(0)  # can't locate vault -> fail open
 
 dm = CREATION_DATE_RE.search(blob)

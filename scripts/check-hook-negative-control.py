@@ -39,6 +39,21 @@ the repo NAMES the hook. That is a FLOOR, not proof:
 Claiming more than this would be the same error the check is about, so the
 message says "no test surface", never "untested" or "unproven".
 
+A CONTROL CAN ALSO FAIL FOR THE WRONG REASON, which is subtler than vacuous
+and reads as more rigorous. Measured 2026-08-28 (PR #610): a test with four
+real assertions, naming the right function, still passed with the fix reverted
+-- three fixtures running, because each tripped a DIFFERENT guard in the same
+call path (the mkdir guard, then the load guard, then the lock) and every one
+of them raised the expected exception TYPE from the wrong SITE. The assertion
+was about an outcome, and several distinct failures produce that same outcome;
+the more fail-closed guards a function has, the likelier a crude fixture trips
+an earlier one. So: revert the specific fix and require RED, and when it stays
+green find which guard actually fired instead of adjusting the assertion. Two
+harness traps in the same family -- a mutation whose search string no longer
+matches silently mutates nothing, and `grep -c '[FAIL]'` scores a CRASHED suite
+as zero failures, identical to a clean pass. Assert the mutation applied; read
+the exit code.
+
   * The name match is a SUBSTRING match, so a hook named `retry-budget` counts
     as covered by a test that only mentions `retry-budget-v2`. That error runs
     in the PERMISSIVE direction (a false GREEN, never a false accusation),
@@ -61,6 +76,8 @@ without a test surface.
 
 ASCII-only output on purpose -- see scripts/check-utf8-stdout.py.
 """
+# exit-contract: ENFORCING
+
 
 from __future__ import annotations
 
@@ -98,14 +115,11 @@ SKIP_PARTS = {".git", "node_modules", "__pycache__", ".venv"}
 NO_TEST_BASELINE: Set[str] = {
     # -- secret / data-exposure guards (highest stakes) --
     "block-secret-in-note",
-    "scrub-session-jsonl-secrets",
     # -- correctness / process guards --
     "agent-briefing-check",
-    "block-branch-switch-with-untracked-build",
     "check-rule-conflicts-on-write",
     "session-turn-counter",
     "snapshot-pending-work-on-stop",
-    "remove-ended-worktree",
     "list-wip-stashes-on-session-start",
     "retry-budget",
     "permission-denied",
@@ -131,6 +145,22 @@ NO_TEST_BASELINE: Set[str] = {
     "imessage-mcp-auto-export",
     "whatsapp-mcp-auto-export",
 }
+
+# THE RATCHET, enforced. The docstring above says this list "may never GROW".
+# Nothing enforced that: measured on the parent commit, appending one name
+# took it 28 -> 29 and the gate still printed "shrinking baseline" and exited
+# 0. Same appendable-suppression-list hole as scripts/check-hook-activation.py
+# (fixed there in the same change). Amnesty ratchets DOWN, never up; raising
+# this number is a deliberate, reviewable act.
+#
+# 28 -> 25, two independent paydowns landing together: `remove-ended-worktree`
+# gained a real test surface (#640/#641), and `block-branch-switch-with-
+# untracked-build` gained one here (its `_bypass` predicate, fleet-tested
+# end to end against a real module-in-flight git fixture). The cap follows
+# the list down to the new length rather than keeping either freed slot as
+# slack -- slack is silently re-appendable, which is the exact hole the
+# ratchet closed.
+NO_TEST_MAX = 25
 
 
 def is_test_surface(path: Path) -> bool:
@@ -180,12 +210,20 @@ def shipped_hooks() -> List[str]:
     )
 
 
-def evaluate(hooks: List[str], blob: str, baseline: Set[str]) -> tuple[List[str], List[str]]:
+def evaluate(hooks: List[str], blob: str, baseline: Set[str],
+             baseline_max: int | None = None) -> tuple[List[str], List[str]]:
     """Pure core: (problems, hooks-with-no-test-surface). Kept free of I/O so
     --selftest can drive it with synthetic inputs instead of writing probe files
     into hooks/, which would race a concurrent run and leave debris on crash."""
     missing = [h for h in hooks if h not in blob]
     problems: List[str] = []
+
+    if baseline_max is not None and len(baseline) > baseline_max:
+        problems.append(
+            f"NO_TEST_BASELINE has {len(baseline)} entries but NO_TEST_MAX is "
+            f"{baseline_max}.\n    The baseline may only SHRINK. Add a test "
+            f"surface for the hook instead of widening the amnesty list."
+        )
 
     for name in missing:
         if name in baseline:
@@ -240,6 +278,18 @@ def selftest() -> int:
     # And the inverse: a clean tree must NOT fail, or the check cries wolf and
     # gets ignored -- the failure mode that makes a guard worthless.
     problems, _ = evaluate(["already-tested"], "already-tested is named here", set())
+
+    # THE RATCHET CAP -- the shape that shipped: a hook with no test surface
+    # waved through by appending one name. Measured on the parent commit as
+    # 28 -> 29, exit 0, output still reading "shrinking".
+    over, _ = evaluate(["g"], "", {"g"}, 0)
+    print(f"{'PASS' if over else 'FAIL'}  baseline OVER cap -> FAIL")
+    at, _ = evaluate(["g"], "", {"g"}, 1)
+    print(f"{'PASS' if not at else 'FAIL'}  baseline AT cap -> pass")
+    nocap, _ = evaluate(["g"], "", {"g"})
+    print(f"{'PASS' if not nocap else 'FAIL'}  no cap given -> cap not enforced")
+    assert over and not at and not nocap, "ratchet-cap control did not bite"
+
     if problems:
         print("  FAIL: a fully-tested tree went RED (false alarm)")
         failures += 1
@@ -290,7 +340,7 @@ def main() -> int:
         print(f"FATAL: found 0 shipped hooks under {HOOK_DIR}.", file=sys.stderr)
         return 2
 
-    problems, missing = evaluate(hooks, blob, NO_TEST_BASELINE)
+    problems, missing = evaluate(hooks, blob, NO_TEST_BASELINE, NO_TEST_MAX)
 
     if args.list:
         for h in missing:

@@ -1056,27 +1056,26 @@ if is_mac && ! have brew && [[ "$CORPORATE_PROFILE" == "1" ]]; then
             "Perfil corporativo: falta Homebrew — se omite su instalación (sin sudo, solo espacio de usuario).")"
   warn "$(t "Install Homebrew via your IT-approved channel + re-run if you want brew-managed python/node. Continuing without it." \
             "Instalá Homebrew por tu canal aprobado de IT + volvé a correr si querés python/node vía brew. Se continúa sin él.")"
+elif is_mac && ! have brew && [[ $DRY_RUN -eq 0 ]] && [[ ! -t 0 ]]; then
+  # Non-interactive (the common case: the user pasted the install prompt into
+  # Claude Code, which runs this in a shell with no TTY to answer the Mac
+  # password prompt Homebrew's installer needs). Attempting it anyway is the
+  # exact MYC-739 cascade (2026-06-09 workshop): it fails on the unanswerable
+  # prompt and drags Obsidian, gh, node, pipx, and graphify down with it — a
+  # wall of red "failed" lines and no setup interview. Same fix as the
+  # corporate branch above: skip brew and keep going instead of stopping here.
+  # The user-space Python/Node fallbacks below don't need brew, and each
+  # brew-carried component note_gaps itself so the setup interview finishes
+  # it quietly. (MYC-739, MYC-4285)
+  warn "$(t "Homebrew needs your Mac password, which a non-interactive run can't type — skipping its install and continuing without it." \
+            "Homebrew necesita tu contraseña de Mac, que una corrida no interactiva no puede tipear — se omite su instalación y se continúa sin él.")"
+  print_terminal_step
+  log "$(t "That Terminal step is optional — only needed if you'd rather have Homebrew-managed installs. Everything below already continues without it." \
+           "Ese paso de Terminal es opcional — solo hace falta si preferís instalaciones vía Homebrew. Todo lo de abajo ya continúa sin él.")"
 elif is_mac && ! have brew; then
-  # Homebrew is genuinely missing. Its installer needs the Mac password at an
-  # interactive sudo prompt. When stdin is NOT a TTY — the common case: the user
-  # pasted the install prompt into Claude Code, which runs this in a
-  # non-interactive shell — that prompt can't be answered. Attempting it anyway
-  # fails and drags Obsidian, gh, node, and every brew-installed tool down with
-  # it: a wall of red "failed" lines and no setup interview (the exact failure
-  # the 2026-06-09 workshop hit). Instead, stop here and hand the user ONE
-  # Terminal command that does every password-gated install, then re-runs this
-  # whole bootstrap idempotently. That is the same "open Terminal, run one line"
-  # step the web guide already lists; surfacing it cleanly here is the recovery
-  # for anyone who skipped it. (MYC-739)
-  if [[ $DRY_RUN -eq 0 ]] && [[ ! -t 0 ]]; then
-    print_terminal_step
-    # For the assistant reading bootstrap output: STOP here. Relay the command
-    # above to the user verbatim and WAIT for them to confirm it finished. Do
-    # NOT try to install Homebrew yourself, do NOT "work around" it, and do NOT
-    # continue to the setup interview until they confirm.
-    exit 0
-  fi
-
+  # Homebrew is genuinely missing, and this IS an interactive terminal (or a
+  # dry run) — its installer needs the Mac password at an interactive sudo
+  # prompt, and here that prompt can actually be answered (or previewed).
   if [[ $DRY_RUN -eq 1 ]]; then
     # A dry run must NEVER mutate the machine. This branch used to fall
     # through to the real installer ("or dry-run: install for real") — a live
@@ -1299,10 +1298,13 @@ if ! have pipx && [[ $DRY_RUN -eq 1 ]]; then
   dry "would: install pipx (brew on Mac; pip --user on Linux)"
 elif ! have pipx; then
   hdr "Installing pipx"
-  if is_mac; then
+  if is_mac && have brew; then
     brew install pipx && pipx ensurepath || err "pipx install failed"
   else
-    "$PY" -m pip install --user pipx && "$PY" -m pipx ensurepath || err "pipx install failed"
+    # No brew (brew-less Mac, same as the Homebrew section above) or Linux:
+    # pip --user needs no elevation and no brew either way.
+    "$PY" -m pip install --user pipx && "$PY" -m pipx ensurepath \
+      || note_gap "pipx" "pip install --user pipx yourself, then re-run"
   fi
 fi
 # pipx installs console scripts into ~/.local/bin, and `pipx ensurepath` only
@@ -1323,8 +1325,12 @@ if ! have gh && [[ $DRY_RUN -eq 1 ]]; then
   dry "would: install gh, the GitHub CLI (brew on Mac; apt/dnf/pacman on Linux)"
 elif ! have gh; then
   hdr "Installing gh (GitHub CLI)"
-  if is_mac; then
+  if is_mac && have brew; then
     brew install gh || warn "gh install failed — non-blocking, continue"
+  elif is_mac; then
+    # Brew-less Mac (same reasoning as the Homebrew section above): no brew
+    # to install it through, and non-blocking either way.
+    note_gap "gh" "install gh yourself from https://cli.github.com, then re-run"
   else
     sudo apt-get install -y gh 2>/dev/null \
       || sudo dnf install -y gh 2>/dev/null \
@@ -1345,7 +1351,7 @@ have gh && ok "gh $(gh --version 2>/dev/null | head -1 | awk '{print $3}')" || t
 if is_mac; then
   if [[ ! -d "/Applications/Obsidian.app" ]] && [[ $DRY_RUN -eq 1 ]]; then
     dry "would: brew install --cask obsidian"
-  elif [[ ! -d "/Applications/Obsidian.app" ]]; then
+  elif [[ ! -d "/Applications/Obsidian.app" ]] && have brew; then
     hdr "$(t "Installing Obsidian" "Instalando Obsidian")"
     log "$(t \
       "Obsidian is the note-taking app this whole setup writes into. Free, runs locally, no account." \
@@ -1357,6 +1363,10 @@ if is_mac; then
       || err "$(t \
         "Obsidian install failed — install manually from https://obsidian.md and re-run this script" \
         "Falló la instalación de Obsidian — instalalo manual desde https://obsidian.md y volvé a correr este script")"
+  elif [[ ! -d "/Applications/Obsidian.app" ]]; then
+    # Brew-less Mac (same reasoning as the Homebrew section above): no brew
+    # to install it through.
+    note_gap "Obsidian" "install Obsidian yourself from https://obsidian.md, then re-run"
   fi
   if [[ -d "/Applications/Obsidian.app" ]]; then
     ok "$(t "Obsidian installed at /Applications/Obsidian.app" \
@@ -1572,7 +1582,7 @@ SKILL_FORKS=()
 SKILL_SYMLINKS=()
 SKILLS_TO_SYNC=()
 
-for sub in graphify cierre-de-llamada meeting-todos patterns insights deconstruct daily-journal rise repurpose-talk nano-banana second-brain-mapping setup-vault-types diagnose note-todos sunday-review coach coaching backfill-journal-body-context longitudinal resolver-query for-my-team health-context health-doctor health-setup ingest-github ingest-health ingest-youtube evolve instinct-export instinct-import interview-me longitudinal doubt-driven-development secret-warn; do
+for sub in graphify cierre-de-llamada meeting-todos patterns insights deconstruct daily-journal rise repurpose-talk nano-banana second-brain-mapping setup-vault-types diagnose note-todos sunday-review coach coaching backfill-journal-body-context longitudinal resolver-query for-my-team health-context health-doctor health-setup ingest-github ingest-health ingest-youtube evolve instinct-export instinct-import interview-me doubt-driven-development secret-warn optimize-brain security-snapshot vault-system skillify-meta-loop; do
   dst="$HOME/.claude/skills/$sub"
 
   if [[ -L "$dst" ]]; then
@@ -2079,7 +2089,7 @@ for check in "${CHECKS[@]}"; do
   fi
 done
 # Skill folders (full bundled set + humanizer + ai-brain-starter itself)
-for sub in graphify cierre-de-llamada meeting-todos patterns insights deconstruct daily-journal rise repurpose-talk nano-banana humanizer ai-brain-starter diagnose second-brain-mapping setup-vault-types note-todos sunday-review coach coaching backfill-journal-body-context longitudinal resolver-query for-my-team health-context health-doctor health-setup ingest-github ingest-health ingest-youtube evolve instinct-export instinct-import interview-me doubt-driven-development secret-warn; do
+for sub in graphify cierre-de-llamada meeting-todos patterns insights deconstruct daily-journal rise repurpose-talk nano-banana humanizer ai-brain-starter diagnose second-brain-mapping setup-vault-types note-todos sunday-review coach coaching backfill-journal-body-context longitudinal resolver-query for-my-team health-context health-doctor health-setup ingest-github ingest-health ingest-youtube evolve instinct-export instinct-import interview-me doubt-driven-development secret-warn optimize-brain security-snapshot vault-system skillify-meta-loop; do
   if [[ -d "$HOME/.claude/skills/$sub" ]]; then
     ok "skill: $sub"
   else

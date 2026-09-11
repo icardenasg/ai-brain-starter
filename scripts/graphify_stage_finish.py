@@ -22,6 +22,9 @@ Usage:
 If graphify is installed via pipx, use the pipx python interpreter.
 For multi-vault setups, pass --vault-root to target a specific vault.
 """
+# exit-contract: ADVISORY -- a pipeline stage whose verification note is
+#   advisory to the operator running the graphify stages by hand
+
 import argparse
 import hashlib
 import json
@@ -45,6 +48,13 @@ sys.path.insert(0, str(_SCRIPT_DIR.parent / "hooks"))
 from graphify_canonicalize import canonicalize, force_valid_file_types
 from _lib.safe_read import safe_read_bytes, safe_read_text  # noqa: E402
 
+
+# graph.json holds the whole vault graph, so it blows past safe_read's 1 MB
+# default early — a few thousand notes is enough. This ceiling is only here to
+# catch a runaway file, not to bound normal growth: the merge below decodes the
+# entire document into memory anyway, so a graph this read would reject is one
+# the script could not process regardless.
+MAX_GRAPH_BYTES = 200_000_000
 
 SLASH_LABEL_RE = re.compile(r"^[\w\s\u00C0-\uFFFF]+/[\w\s\u00C0-\uFFFF]+$")
 
@@ -242,7 +252,7 @@ def main():
     graph_path = Path(args.graph_path)
     if graph_path.exists():
         backup = Path(args.graph_path + f".backup_{ts}_pre_{args.stage_name.replace(' ', '_')}_finish")
-        graph_read = safe_read_bytes(graph_path)
+        graph_read = safe_read_bytes(graph_path, max_bytes=MAX_GRAPH_BYTES)
         if not graph_read.ok:
             print(f"  ERROR: could not read existing graph.json ({graph_read.status}), aborting")
             sys.exit(1)
