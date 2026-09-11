@@ -39,6 +39,19 @@ SKIP_PARTS = {
     ".obsidian", ".git", "node_modules",
 }
 
+# A symlinked top-level folder is ANOTHER vault mounted inside this one (the
+# Phase 20 team-vault pattern). glob's `**` follows those links, so without this
+# every personal-vault script would read — and metadata-extract would WRITE —
+# into the other vault, typically a live cloud-sync folder. Skip them by name.
+try:
+    SKIP_PARTS |= {
+        _e for _e in os.listdir(VAULT)
+        if os.path.islink(os.path.join(VAULT, _e))
+        and os.path.isdir(os.path.join(VAULT, _e))
+    }
+except OSError:
+    pass
+
 SKIP_LINE_PREFIXES = (
     "#", "---", "**Gym", "**Sleep", "**RescueTime",
     "**Panel", "**Dissent", "**Omission", "*Floor", "## ",
