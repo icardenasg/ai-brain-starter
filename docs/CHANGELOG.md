@@ -29,6 +29,20 @@ One practical note that cost an hour: the default's **first call after an idle s
 
 ---
 
+## 2026-09-04: "creo que ya" did nothing, so you had to say goodbye twice
+
+**Who this affects:** anyone working in Spanish who signs off with *creo que ya* — roughly, "I think that's it".
+
+Spanish has a lot of ways to say you are done, and the detector knows most of them. This one it did not know at all. Typed on its own, *creo que ya* matched no tier — not a strong sign-off, not an ambiguous one, nothing — so the session carried on and you had to say goodbye a second time, in different words, before anything happened.
+
+It now sits in the ambiguous tier rather than the strong one. That is deliberate. On its own the phrase is a goodbye. It is also how a lot of sentences start that are not — *creo que ya entendí*, *creo que ya lo tengo*. Ambiguous is the tier for exactly that: Claude asks whether you meant to close, instead of guessing and filing your session while you are still mid-sentence.
+
+Only the bare phrase matches. Anything written after it falls through untouched, the same as every other entry in that tier.
+
+*creo que ya está* is very likely the same case, but it has not been reported or observed in use, so it was left alone rather than added on a hunch.
+
+---
+
 ## 2026-09-02: /graphify can now show you what its typed edges would do, before they do it
 
 **Who this affects:** anyone running `/graphify` on a vault with frontmatter and wikilinks — so, anyone whose graph is built from notes rather than code.
@@ -63,6 +77,24 @@ Obsidian's graph draws exactly one thing: links. An entry that records its floor
 - **Floor names now compare through link syntax.** `[[Acceptance|Aceptación]]`, `Aceptación` and `Acceptance` all resolve to the same floor. The journal index still stores the plain name, so `/weekly` and `/patterns` read exactly what they read before.
 
 This builds on the 2026-08-25 fix below, which taught the checker to find your floor notes folder in the first place — that fix found the notes, this one lets linked entries match them.
+
+---
+
+## 2026-08-25: asking Claude to pass on a message could end your session by mistake
+
+**Who this affects:** anyone working in Spanish who asks Claude to relay something — "dile a Ana que ya quedó", "avísale a Marta que listo", "contéstale que hasta luego".
+
+Spanish ends a session with short phrases: *ya quedó*, *listo*, *chao*, *hasta luego*. The detector looks for them at the end of what you type, which is the right place to look — until the phrase is not yours. When you ask Claude to tell someone *else* that something is done, your sentence still ends on *ya quedó*. You are quoting a message, not saying goodbye.
+
+The detector could not tell the two apart. Typing "dile a Ana que ya quedó" ran the whole close cascade in the middle of a task — session file written, captures filed, commit made, goodbye said — while the user was still working and had asked for none of it. The phrase was message content addressed to a third person, and it read as a farewell.
+
+Spanish now has a guard for relayed speech. When a sentence carries a verb of telling — *dile*, *avísale*, *escríbele*, *cuéntale*, *contéstale*, *mándale… diciendo* — followed by *que* and then a close phrase, the close is suppressed. Saying the same phrase on its own still ends the session: "ya quedó" closes, "dile a Ana que ya quedó" does not.
+
+This had to sit in the strict tier. *ya quedó* and a bare *listo* are strong signals, and the ordinary guards cannot override a strong signal — a weaker guard would have been dead code.
+
+Portuguese very likely has the same gap (*diga a ele que pronto*), but it has not been reported or tested, so nothing was changed there.
+
+---
 
 ## 2026-08-25: the check on your journal's floor labels was never running
 
