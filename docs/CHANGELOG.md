@@ -9,6 +9,22 @@ description: What's new in AI Brain Starter — plain English, no jargon
 
 ---
 
+## 2026-09-10: daily maintenance was quietly not running — two bugs, both silent
+
+**Who this affects:** everyone. `vault-daily-maintenance.sh` runs from a LaunchAgent and is what keeps your aggregated files current and your deferred close artifacts committed.
+
+**Bug 1 — if you work unplugged, the pass never ran.** The battery gate deferred whenever the machine was on battery, at any charge level. Each deferral logged `next run catches up` — but on a laptop that is usually unplugged, the next run defers too, and the one after that. One install went **nine days** with seven consecutive deferrals; five were on battery, three of those with the load average at 0.17, 0.16 and 1.24 per core. There was nothing to protect and nothing caught up.
+
+The intent was right — a GC pass is not worth someone's last charge — so the gate now uses a threshold instead of a yes/no: it defers below **50%** and runs above it. Set `MAINT_MIN_BATTERY_PCT` to change the floor. As before, a machine whose charge cannot be read runs the pass rather than stalling forever.
+
+**Bug 2 — the aggregators failed on every single run, and the failure was invisible.** Both `aggregate-sessions.py` and `aggregate-decisions.py` resolve their own vault and deliberately discard a `VAULT_ROOT` that points elsewhere. Because the maintenance script lives inside the skill checkout, they auto-detected the *skill* directory, failed with `<skill>/⚙️ Meta does not exist`, and exited 1. The log recorded `rc=1` and nothing surfaced it, so a pass that reported success had aggregated nothing.
+
+The two calls now pass `VAULT_ROOT_FORCE=1`, which is the override the aggregators themselves tell you to use. No change to the aggregators.
+
+**Why it stayed hidden:** both failures are silent by construction. The battery gate writes a reassuring line and exits 0; the aggregator failure is one `rc=1` in a log nobody reads. If your `Last Session.md` has felt stale, this is why.
+
+---
+
 ## 2026-09-09: the NVIDIA grunt-work models are back — and the map now tells you it will rot
 
 **Who this affects:** anyone using `scripts/nvidia.sh` or `_nvidia_router.py` to send cheap, bulk work to NVIDIA's free tier instead of Claude.
