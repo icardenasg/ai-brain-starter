@@ -27,8 +27,16 @@ from datetime import date, datetime
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(HERE, "extractors"))
+sys.path.insert(0, os.path.join(HERE, "..", "hooks"))
 
 from _base import VAULT, CRM_ROOT, SKIP_PARTS, WIKILINK_RE, get_crm_names  # noqa: E402
+from _lib.safe_read import safe_read_text  # noqa: E402
+
+# Per-file read timeout (s) for the vault walk in resolved_note_names(). The
+# shared reader rejects special/offline files before open; an unknown
+# placeholder or stalled cloud-sync mount is abandoned at this deadline
+# instead of hanging the whole sweep (scripts/check-cloud-safe-file-walkers.py).
+READ_TIMEOUT = 5.0
 
 
 def fold_name(name):
@@ -63,11 +71,8 @@ def resolved_note_names():
         for f in glob.glob(os.path.join(VAULT, "**", "*.md"), recursive=True):
             if set(f.split(os.sep)) & SKIP_PARTS:
                 continue
-            try:
-                with open(f, "r", encoding="utf-8", errors="replace") as fh:
-                    head = fh.read(600)
-            except Exception:
-                head = ""
+            result = safe_read_text(f, timeout=READ_TIMEOUT, max_bytes=1_000_000, errors="replace")
+            head = result.text[:600] if result.ok else ""
             m = _TYPE_RE.search(head)
             if m and m.group(1) in MIRROR_TYPES:
                 continue
@@ -143,11 +148,10 @@ def is_likely_person_name(candidate):
 
 def scan_file_for_names(filepath):
     """Return set of unique candidate person names from a file's wikilinks."""
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            content = f.read()
-    except Exception:
+    result = safe_read_text(filepath, timeout=READ_TIMEOUT, max_bytes=1_000_000)
+    if not result.ok:
         return set()
+    content = result.text
     candidates = set()
     for m in WIKILINK_RE.findall(content):
         base = os.path.basename(m.strip())
